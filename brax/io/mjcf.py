@@ -423,6 +423,85 @@ def _dof_inertia_bound(mj: mujoco.MjModel, n_samples: int = 32,
           np.maximum(np.median(np.stack(samples), axis=0), 1e-9))
 
 
+def _prox_axis_inertia(mj: mujoco.MjModel, n_samples: int = 32,
+                       seed: int = 0) -> np.ndarray:
+  """Per-DOF axis inertia of everything PROXIMAL to a driven hinge.
+
+  For a joint on a FREE-rooted chain (Spot's legs), a positional drive must
+  split its correction between the distal subtree (`drive_w`) and the rest of
+  the robot it recoils against -- trunk plus the other legs.  This is that
+  proximal side's rigid-body inertia about the joint's world axis at its
+  world anchor: sum over the same-root bodies OUTSIDE the joint's subtree of
+  ``m (|d|^2 - (d.axis)^2) + axis . R I R^T . axis``, median over sampled
+  configurations (same sampling as `_dof_inertia_bound`).  Zero where the
+  chain root is not free -- there the world absorbs the reaction and
+  `drive_update`'s one-sided form is exact.
+  """
+  d = mujoco.MjData(mj)
+  rng = np.random.default_rng(seed)
+  hinge_slide = [j for j in range(mj.njnt)
+                 if int(mj.jnt_type[j]) in (2, 3) and mj.jnt_limited[j]
+                 and np.all(np.isfinite(mj.jnt_range[j]))]
+  # subtree membership: body b's subtree = b plus descendants
+  children = [[] for _ in range(mj.nbody)]
+  for b in range(1, mj.nbody):
+    children[int(mj.body_parentid[b])].append(b)
+  def subtree(b):
+    out, stack = set(), [b]
+    while stack:
+      k = stack.pop()
+      out.add(k)
+      stack.extend(children[k])
+    return out
+  # free-rooted bodies: walk up looking for a free joint
+  def free_rooted(b):
+    while b != 0:
+      for j in range(int(mj.body_jntadr[b]),
+                     int(mj.body_jntadr[b]) + int(mj.body_jntnum[b])):
+        if int(mj.jnt_type[j]) == 0:
+          return True
+      b = int(mj.body_parentid[b])
+    return False
+  targets = []
+  for j in range(mj.njnt):
+    if int(mj.jnt_type[j]) != 3:
+      continue
+    b = int(mj.jnt_bodyid[j])
+    if not free_rooted(b):
+      continue
+    sub = subtree(b)
+    root = int(mj.body_rootid[b])
+    prox = [k for k in range(1, mj.nbody)
+            if int(mj.body_rootid[k]) == root and k not in sub]
+    if prox:
+      targets.append((j, prox))
+  out = np.zeros(mj.nv)
+  if not targets:
+    return out
+  samples = {j: [] for j, _ in targets}
+  for k in range(n_samples + 1):
+    d.qpos[:] = mj.qpos0
+    if k:
+      for j in hinge_slide:
+        lo, hi = float(mj.jnt_range[j][0]), float(mj.jnt_range[j][1])
+        d.qpos[int(mj.jnt_qposadr[j])] = rng.uniform(lo, hi)
+    mujoco.mj_kinematics(mj, d)
+    mujoco.mj_comPos(mj, d)
+    for j, prox in targets:
+      anchor, axis = d.xanchor[j], d.xaxis[j]
+      total = 0.0
+      for b in prox:
+        m = float(mj.body_mass[b])
+        dd = d.xipos[b] - anchor
+        r = d.ximat[b].reshape(3, 3)
+        total += m * (float(dd @ dd) - float(dd @ axis) ** 2)
+        total += float(axis @ (r @ np.diag(mj.body_inertia[b]) @ r.T) @ axis)
+      samples[j].append(total)
+  for j, _ in targets:
+    out[int(mj.jnt_dofadr[j])] = float(np.median(samples[j]))
+  return out
+
+
 def _fold_armature(mj: mujoco.MjModel, lm, link_i: np.ndarray,
                    link_mass: np.ndarray, link_iquat: np.ndarray,
                    dof_link: np.ndarray) -> np.ndarray:
@@ -778,6 +857,10 @@ def load_model(mj: mujoco.MjModel) -> System:
   # free-floating base.
   drive_at = np.ones(mj.nv)
   drive_lam_max = np.full(mj.nv, np.inf)
+  # proximal (recoil-side) inverse mobility for free-rooted driven hinges;
+  # stays 0 for fixed-base chains, so their drive behaviour is unchanged
+  _prox_inertia = _prox_axis_inertia(mj)
+  drive_w_prox = np.where(_prox_inertia > 0, 1.0 / np.maximum(_prox_inertia, 1e-9), 0.0)
   drive_kvkp = np.zeros(mj.nv)
   drive_lo = np.full(mj.nv, -np.inf)
   drive_hi = np.full(mj.nv, np.inf)
@@ -893,6 +976,7 @@ def load_model(mj: mujoco.MjModel) -> System:
       drive_gear=drive_gear,
       drive_alpha=drive_alpha,
       drive_w=drive_w,
+      drive_w_prox=drive_w_prox,
       drive_at=drive_at,
       drive_lam_max=drive_lam_max,
       drive_kvkp=drive_kvkp,

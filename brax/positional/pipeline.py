@@ -22,6 +22,7 @@ from brax import contact
 from brax import _fork_joint_dynamics
 from brax import fluid
 from brax import kinematics
+from brax import math
 from brax.base import Motion, System, Transform
 from brax.io import mjcf
 from brax.positional import collisions
@@ -36,11 +37,24 @@ import numpy as np
 # explore_bench fork: opt-in, A/B'd against the original (see _contact_sweeps).
 _CONTACT_PRE = os.environ.get(
     'BRAX_FORK_CONTACT_PRE', '0').lower() not in ('0', '', 'false', 'no')
+# BRAX_FORK_CONTACT_IN_SWEEP=1 runs ONE contact position pass inside every
+# joint sweep instead of the contact block after the loop. Measured and
+# REJECTED as a default (drift 1.92 -> 6.22 m on spot stance; verdict at
+# the sweep loop) -- kept as the A/B record.
+_CONTACT_IN_SWEEP = os.environ.get(
+    'BRAX_FORK_CONTACT_IN_SWEEP', '0').lower() not in ('0', '', 'false', 'no')
 # BRAX_FORK_DEPTH_SIGN_LEGACY=1 restores the inverted depth refresh below,
 # for A/B only.
 _DEPTH_SIGN = -1.0 if os.environ.get(
     'BRAX_FORK_DEPTH_SIGN_LEGACY', '0').lower() not in (
         '0', '', 'false', 'no') else 1.0
+
+
+def _smallquat(v):
+  # exp map for the small per-pass rotation vectors the sweep accumulates
+  half = 0.5 * v
+  w = jp.sqrt(jp.maximum(1.0 - half @ half, 1e-8))
+  return jp.concatenate([w[None], half])
 
 
 def init(
@@ -145,8 +159,38 @@ def step(
     x, _ = com.to_world(sys, x_i, st.xd_i)
     return st.replace(x=x, x_i=x_i)
 
+  # BRAX_FORK_CONTACT_IN_SWEEP=1: one contact position pass inside every
+  # joint sweep. MEASURED AND REJECTED as a default -- kept only as the A/B
+  # record. Motivation: solving contacts once after the joint sweeps leaves
+  # the drive and the stance contacts sequentially coupled, and on spot
+  # (ARTMASS + free-dof + drive-reaction all on, constant stance command)
+  # the trunk retains a ~0.5 m/s wander no single stage applies. The
+  # interleave was supposed to iterate the pair toward the coupled fixed
+  # point; measured instead: trunk drift 1.92 m -> 6.22 m over the same
+  # replay, direction REVERSED -- per-sweep friction re-measured against the
+  # partially-restored pose over-corrects, and the drive (whose multiplier
+  # is contractive across sweeps) loses the alternation. The wander is also
+  # invariant to sweep counts (jsw 8->2: 1.86 m; csw 2->4: 1.87 m), so no
+  # ordering of the SEPARATE projections reaches the coupled answer: the
+  # remaining fix is a simultaneous joints+drive+contact solve per substep.
+  # Manifold detected once; depth refreshed per pass; the push-out velocity
+  # subtraction accumulates each pass's applied delta (small-angle rotation
+  # vectors), since no single pose pair brackets interleaved passes.
+  c_sw = contact.get(sys, state.x) if _CONTACT_IN_SWEEP else None
+  if c_sw is not None:
+    from brax import _fork_contact_lane as _clane
+    link_sw = (jp.asarray(c_sw.link_idx[0]), jp.asarray(c_sw.link_idx[1]))
+    n_w_sw = (_DEPTH_SIGN * c_sw.frame[..., 0, 0],
+              _DEPTH_SIGN * c_sw.frame[..., 0, 1],
+              _DEPTH_SIGN * c_sw.frame[..., 0, 2])
+    cpos_sw = (c_sw.pos[..., 0], c_sw.pos[..., 1], c_sw.pos[..., 2])
+    rloc_sw = _clane.contact_local(sys, state.x, link_sw, cpos_sw)
+    dist0_sw = c_sw.dist
+    acc0 = (jp.zeros_like(state.x_i.pos), jp.zeros_like(state.x_i.pos),
+            jp.zeros_like(dist0_sw))
+
   def _joint_sweep(carry, _):
-    st, lam = carry
+    st, lam, acc = carry
     # GAUSS-SEIDEL over the three constraint families, not Jacobi.
     #
     # The joint projection, the servo drives and the equality couplings each
@@ -169,11 +213,28 @@ def step(
       _j, _jd, _, _ = _kin.world_to_joint(sys, st.x, st.xd)
       _q, _ = _kin.inverse(sys, _j, _jd)
       st = _apply(st, st.x_i + joints.equality_update(sys, st, _q))
-    return (st, lam), None
+    if c_sw is not None:
+      depth = _clane.refresh_depth(sys, st.x, link_sw, rloc_sw, n_w_sw,
+                                   dist0_sw)
+      x_i_before = st.x_i
+      x_i_c, (dl_c, _) = collisions.resolve_position(
+          sys, st, x_i_prev, c_sw.replace(dist=depth))
+      dpos, drot, dlam_acc = acc
+      dq_rel = jax.vmap(math.relative_quat)(x_i_before.rot, x_i_c.rot)
+      rotvec = 2.0 * dq_rel[:, 1:] * jp.where(
+          dq_rel[:, :1] >= 0.0, 1.0, -1.0)
+      acc = (dpos + (x_i_c.pos - x_i_before.pos), drot + rotvec,
+             dlam_acc + dl_c)
+      st = _apply(st, x_i_c)
+    return (st, lam, acc), None
 
   n_sweeps = max(1, int(sys.joint_solver_iterations))
-  (state, _), _ = jax.lax.scan(_joint_sweep, (state, lam0), None,
-                               length=n_sweeps)
+  if c_sw is not None:
+    (state, _, (acc_pos, acc_rot, acc_dl)), _ = jax.lax.scan(
+        _joint_sweep, (state, lam0, acc0), None, length=n_sweeps)
+  else:
+    (state, _, _), _ = jax.lax.scan(
+        _joint_sweep, (state, lam0, (0.0, 0.0, 0.0)), None, length=n_sweeps)
   x_i, x = state.x_i, state.x
 
   # apply position level collision updates
@@ -191,8 +252,23 @@ def step(
   # substep the contact normal and the material points barely rotate, so the
   # manifold is held fixed and only the PENETRATION DEPTH is refreshed from
   # the current pose, which is the standard position-based contact solve.
-  c = contact.get(sys, x)
-  x_i, dlambda = _contact_sweeps(sys, state, x_i_prev, c, xd_i)
+  if c_sw is not None:
+    # contacts were already solved inside the sweep loop; hand the velocity
+    # pass the ACCUMULATED normal impulse and a synthetic pre-pose that
+    # reproduces the summed contact delta, so the push-out subtraction stays
+    # momentum-neutral across all interleaved passes.
+    c = c_sw
+    q_delta = jax.vmap(
+        lambda v, q: math.quat_mul(_smallquat(v), q))(acc_rot, x_i.rot)
+    x_pre_synth = Transform(pos=x_i.pos - acc_pos,
+                            rot=jax.vmap(math.normalize)(jax.vmap(
+                                lambda v, q: math.quat_mul(
+                                    _smallquat(-v), q))(acc_rot, x_i.rot))[0])
+    del q_delta
+    dlambda = (acc_dl, x_pre_synth)
+  else:
+    c = contact.get(sys, x)
+    x_i, dlambda = _contact_sweeps(sys, state, x_i_prev, c, xd_i)
   xd_i_prev = xd_i
 
   xd_i = integrator.project_xd(sys, x_i, x_i_prev)

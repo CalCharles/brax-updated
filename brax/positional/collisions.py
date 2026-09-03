@@ -48,18 +48,19 @@ _ART_CACHE = {}
 def _art_tables(sys):
   """Static structure for the articulated contact path.
 
-  Returns ``(anc, own, free_root, n_dof)``:
+  Returns ``(anc, own, free_root, n_dof, free_dof)``:
     anc       (n_link, n_dof) 1.0 where dof i is an ancestor-or-self dof of
               link k -- the same `desc` matrix `joints.drive_update` builds,
-              in dof rather than link columns.  Single-DOF joints only; a
-              free joint contributes no column (its mobility is the free-body
-              term instead).
+              in dof rather than link columns.  Single-DOF joints AND the six
+              dofs of every free joint (see the free-joint comment below).
     own       (n_dof,) the link that owns each dof, for indexing the per-LINK
-              joint anchor `a_p`.
-    free_root (n_link,) 1.0 when the link's chain root is a FREE joint, i.e.
-              when the free-body inverse mass is a real mobility rather than
-              a fiction.  A fixed-base arm's fingertip is NOT free: today's
-              `1/m_link` treats it as though it were.
+              joint anchor `a_p` (for a free dof: the free link itself).
+    free_root (n_link,) 1.0 when the link's chain root is a FREE joint AND
+              the legacy free-body treatment is requested
+              (`BRAX_FORK_ART_FREELEGACY=1`); all zeros otherwise, because
+              the free joint's own articulated columns carry that mobility.
+    free_dof  (n_dof,) bool, True on free-joint dofs -- `_art_dofs` gives
+              these world axes and a link-origin anchor.
   """
   key = id(sys)
   hit = _ART_CACHE.get(key)
@@ -67,6 +68,7 @@ def _art_tables(sys):
     return hit
   n_link = sys.num_links()
   link_dof = np.full(n_link, -1, np.int64)
+  free_base = np.full(n_link, -1, np.int64)
   is_free = np.zeros(n_link, bool)
   off = 0
   for i, ty in enumerate(sys.link_types):
@@ -74,11 +76,28 @@ def _art_tables(sys):
       link_dof[i] = off
     if ty == 'f':
       is_free[i] = True
+      free_base[i] = off
     off += QD_WIDTHS[ty]
   n_dof = off
   anc = np.zeros((n_link, n_dof), np.float32)
   own = np.zeros(n_dof, np.int64)
   free_root = np.zeros(n_link, np.float32)
+  free_dof = np.zeros(n_dof, bool)
+  # A free joint IS six articulated dofs: three world translations and three
+  # world rotations about the free link's origin, with `dof_inertia` already
+  # carrying diag(M) for them (subtree mass / subtree inertia about that
+  # origin). Modelling that mobility instead as the CONTACT link's own
+  # free-body response (the `free_root` flag consumed below) is only correct
+  # for a bare free body; on a floating-base robot it hands a foot contact
+  # the FOOT's inverse mass (~3 kg^-1 plus its spherical rotation) where the
+  # true mobility through the trunk is ~1/30 kg^-1 -- measured on spot as
+  # knees ringing to 1000 rad/s under stance while MuJoCo holds 16.
+  # BRAX_FORK_ART_FREELEGACY=1 restores the free-body treatment for A/B.
+  for i in range(n_link):
+    if free_base[i] >= 0 and not _ART_FREELEGACY:
+      for d in range(6):
+        own[free_base[i] + d] = i
+        free_dof[free_base[i] + d] = True
   for k in range(n_link):
     a = k
     while a >= 0:
@@ -87,13 +106,18 @@ def _art_tables(sys):
         own[link_dof[a]] = a
       if is_free[a]:
         free_root[k] = 1.0
+        if not _ART_FREELEGACY:
+          anc[k, free_base[a]:free_base[a] + 6] = 1.0
       a = int(sys.link_parents[a])
-  out = (anc, own, free_root, n_dof)
+  if not _ART_FREELEGACY:
+    # articulated free dofs replace the free-body share entirely
+    free_root[:] = 0.0
+  out = (anc, own, free_root, n_dof, free_dof)
   _ART_CACHE[key] = out
   return out
 
 
-def _art_dofs(sys, state, own, n_dof):
+def _art_dofs(sys, state, own, n_dof, free_dof=None):
   """Per-dof world axis, anchor and the 6-vector that evaluates J_i . f.
 
   For a contact impulse ``f`` applied at world point ``p``, the generalised
@@ -123,6 +147,16 @@ def _art_dofs(sys, state, own, n_dof):
   anchor = a_p.pos.take(own_j, axis=0)
   ang = jax.vmap(math.rotate)(sys.dof.motion.ang[:n_dof], rot_own)
   vel = jax.vmap(math.rotate)(sys.dof.motion.vel[:n_dof], rot_own)
+  if free_dof is not None and free_dof.any():
+    # free-joint dofs (see _art_tables): brax stores their qd in WORLD axes
+    # (kinematics.jcalc reads them straight into world j/jd), so the stored
+    # motion rows are used unrotated, and the rotation dofs pivot at the free
+    # LINK ORIGIN -- x.pos, which both diag(M) and kinematics.forward are
+    # referenced to -- not at any parent joint anchor.
+    fm = jp.asarray(free_dof)[:, None]
+    ang = jp.where(fm, sys.dof.motion.ang[:n_dof], ang)
+    vel = jp.where(fm, sys.dof.motion.vel[:n_dof], vel)
+    anchor = jp.where(fm, state.x.pos.take(own_j, axis=0), anchor)
   dof_i = sys.dof_inertia[:n_dof]
   winv = jp.where(dof_i > 0, 1.0 / jp.where(dof_i > 0, dof_i, 1.0), 0.0)
   a6 = jp.concatenate([ang, vel - jp.cross(ang, anchor)], axis=-1)
@@ -267,6 +301,11 @@ def resolve_position_vecform(
 
 
 _ART_ENABLED = _envflag('BRAX_FORK_ARTMASS')
+# restores the pre-fix free-body treatment of free chain roots (A/B only)
+_ART_FREELEGACY = _envflag('BRAX_FORK_ART_FREELEGACY')
+# restores the penetration-sized Coulomb budget (A/B only; see the friction
+# comment in _resolve_velocity_art)
+_ART_FRICTIONLEGACY = _envflag('BRAX_FORK_ART_FRICTIONLEGACY')
 _ART_ALPHA = float(os.environ.get('BRAX_FORK_ARTMASS_ALPHA', '1e-4'))
 _ART_CLAMP = float(os.environ.get('BRAX_FORK_ARTMASS_CLAMP', '1.0'))
 _ART_KAPPA = _envflag('BRAX_FORK_ARTMASS_KAPPA', '1')
@@ -364,10 +403,10 @@ def _resolve_position_art(sys, state, x_i_prev, contact):
       the ball's nominal 300 ``|c|`` (which cancels anyway) and leaves the
       finger's exactly ``|c|`` untouched.
   """
-  anc_np, own, free_np, n_dof = _art_tables(sys)
+  anc_np, own, free_np, n_dof, free_dof = _art_tables(sys)
   n_link = sys.num_links()
   anc = jp.asarray(anc_np)
-  ang, vel, anchor, winv, a6 = _art_dofs(sys, state, own, n_dof)
+  ang, vel, anchor, winv, a6 = _art_dofs(sys, state, own, n_dof, free_dof)
 
   inv_mass = 1 / (sys.link.inertia.mass ** (1 - sys.spring_mass_scale))
   inv_inertia = com.inv_inertia(sys, state.x)
@@ -489,10 +528,10 @@ def _resolve_velocity_art(sys, state, xd_i_prev, contact, dlambda_pack):
   push-out momentum-neutral -- is unchanged from the routine below.
   """
   dlambda, x_i_pre = dlambda_pack
-  anc_np, own, free_np, n_dof = _art_tables(sys)
+  anc_np, own, free_np, n_dof, free_dof = _art_tables(sys)
   n_link = sys.num_links()
   anc = jp.asarray(anc_np)
-  ang, vel, anchor, winv, a6 = _art_dofs(sys, state, own, n_dof)
+  ang, vel, anchor, winv, a6 = _art_dofs(sys, state, own, n_dof, free_dof)
 
   inv_mass = 1 / (sys.link.inertia.mass ** (1 - sys.spring_mass_scale))
   inv_inertia = com.inv_inertia(sys, state.x)
@@ -541,13 +580,28 @@ def _resolve_velocity_art(sys, state, xd_i_prev, contact, dlambda_pack):
   v_t_norm = _rownorm(v_t)
   v_t_dir = v_t / jp.where(v_t_norm > 1e-9, v_t_norm, 1.0)[:, None]
 
-  dvel = -jp.minimum(contact.friction[:, 0] * jp.abs(dlambda) / sys.opt.timestep,
-                     v_t_norm)
+  pvp = _pt_vel(xd_i_prev)
+  v_n_prev = jax.vmap(jp.dot)(pvp[:, 0] - pvp[:, 1], n_w)
+  # COULOMB BUDGET INCLUDES THE IMPACT IMPULSE. `dlambda` is the position
+  # pass's push-out, proportional to penetration depth -- correct at settled
+  # contact, but during an IMPACT the physically transferred normal impulse
+  # is the approach velocity this very pass removes, and a budget of
+  # mu*|dlambda|/h alone under-sizes friction exactly then (the class of the
+  # measured jaw slip: the held ball slid out at ~0.7 m/s where MuJoCo holds
+  # it). |v_n_prev| where sinking IS that impulse in velocity units, so it
+  # joins the budget. Measured NO effect on spot's stance skating (at steady
+  # stance v_n_prev ~ 0, so the term is inert there -- that defect was the
+  # drive's missing recoil, fixed in joints.drive_update) and no paddle
+  # restitution change. BRAX_FORK_ART_FRICTIONLEGACY=1 restores the old
+  # bound.
+  v_n_removed = jp.abs(v_n_prev) * (v_n_prev <= 0.0)
+  budget = contact.friction[:, 0] * (jp.abs(dlambda) / sys.opt.timestep
+                                     + (0.0 if _ART_FRICTIONLEGACY
+                                        else 1.0) * v_n_removed)
+  dvel = -jp.minimum(budget, v_t_norm)
   wt = _w(v_t_dir)
   p_dyn = (dvel / (wt[:, 0] + wt[:, 1] + 1e-6))[:, None] * v_t_dir
 
-  pvp = _pt_vel(xd_i_prev)
-  v_n_prev = jax.vmap(jp.dot)(pvp[:, 0] - pvp[:, 1], n_w)
   dv_rest = n_w * (-v_n - jp.minimum(contact.elasticity * v_n_prev, 0))[:, None]
   cr_ = _rownorm(dv_rest)
   nr = dv_rest / (cr_ + 1e-6)[:, None]

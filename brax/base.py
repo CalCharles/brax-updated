@@ -519,6 +519,7 @@ class System(mjx.Model):
   drive_gear: jax.Array = None
   drive_alpha: jax.Array = None
   drive_w: jax.Array = None
+  drive_w_prox: jax.Array = None
   drive_at: jax.Array = None
   drive_lam_max: jax.Array = None
   #: kv / kp per DOF for position servos. MuJoCo's position actuator is
