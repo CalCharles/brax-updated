@@ -119,7 +119,13 @@ def site_force(sys: System, act: jax.Array, x, x_i):
   # transport the force from the site to the link centre of mass
   ang = ang + jp.cross(site_pos - x_i.pos[idx], vel)
 
-  return Force(
-      vel=segment_sum(vel, idx, n_link),
-      ang=segment_sum(ang, idx, n_link),
-  )
+  # DENSE one-hot accumulation instead of segment_sum. On TPU a scatter is
+  # emulated and its megacore (batch-split) lowering compiles pathologically
+  # slowly -- measured on drone-catch: with these scatters inside the
+  # frame_skip scan the v4 compile went 82 s at n=64 to >1 h at n=1024, while
+  # CPU stayed ~15 s at every batch and the graph is otherwise SMALLER than
+  # catch/spot (which have no fluid/site actuators and compile fine). idx is
+  # static (site_act_link), so the one-hot is a constant (n_link, n_site)
+  # matrix and this is a tiny dense matmul -- identical result, no scatter.
+  onehot = (jp.arange(n_link)[:, None] == idx[None, :]).astype(vel.dtype)
+  return Force(vel=onehot @ vel, ang=onehot @ ang)

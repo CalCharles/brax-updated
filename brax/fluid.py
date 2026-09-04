@@ -182,8 +182,13 @@ def _body_box_force(sys, xd_i: Motion, box_tables) -> Force:
   f_c = jp.einsum('kij,kj->ki', rot_bc, f)
   t_c = jp.einsum('kij,kj->ki', rot_bc, t) + jp.cross(r_bc, f_c)
   n_link = xd_i.vel.shape[0]
-  return Force(vel=segment_sum(f_c, li, n_link),
-               ang=segment_sum(t_c, li, n_link))
+  # DENSE one-hot accumulation, not segment_sum: TPU emulates scatter and its
+  # megacore batch-split lowering compiles pathologically slowly inside the
+  # frame_skip scan (drone-catch v4: 82 s at n=64 -> >1 h at n=1024; CPU flat
+  # ~15 s). `li` is static, so the one-hot is a constant (n_link, n_src)
+  # matrix and this is a tiny dense matmul with the identical result.
+  _oh = (jp.arange(n_link)[:, None] == li[None, :]).astype(f_c.dtype)
+  return Force(vel=_oh @ f_c, ang=_oh @ t_c)
 
 
 def _ellipsoid_force(sys, xd_i: Motion, tables) -> Force:
@@ -218,8 +223,13 @@ def _ellipsoid_force(sys, xd_i: Motion, tables) -> Force:
   f_c = jp.einsum('kij,kj->ki', rot_gc, f)
   t_c = jp.einsum('kij,kj->ki', rot_gc, t) + jp.cross(r_gc, f_c)
   n_link = xd_i.vel.shape[0]
-  return Force(vel=segment_sum(f_c, li, n_link),
-               ang=segment_sum(t_c, li, n_link))
+  # DENSE one-hot accumulation, not segment_sum: TPU emulates scatter and its
+  # megacore batch-split lowering compiles pathologically slowly inside the
+  # frame_skip scan (drone-catch v4: 82 s at n=64 -> >1 h at n=1024; CPU flat
+  # ~15 s). `li` is static, so the one-hot is a constant (n_link, n_src)
+  # matrix and this is a tiny dense matmul with the identical result.
+  _oh = (jp.arange(n_link)[:, None] == li[None, :]).astype(f_c.dtype)
+  return Force(vel=_oh @ f_c, ang=_oh @ t_c)
 
 
 def _box_viscosity(box: jax.Array, xd_i: Motion, viscosity: jax.Array) -> Force:
