@@ -730,9 +730,14 @@ def resolve_velocity_vecform(
     v_n = jp.dot(rel_vel, n)
     v_t = rel_vel - n * v_n
     v_t_dir, v_t_norm = math.normalize(v_t)
-    dvel = -v_t_dir * jp.minimum(
-        contact.friction[0] * jp.abs(dlambda) / sys.opt.timestep, v_t_norm
-    )
+    budget = contact.friction[0] * jp.abs(dlambda) / sys.opt.timestep
+    if sys.friction_budget_velocity:
+      # momentum -> velocity: times the inverse mass along the contact normal
+      crn1 = jp.cross(contact.pos - x.pos[0], n)
+      crn2 = jp.cross(contact.pos - x.pos[1], n)
+      budget = budget * (mass_inv[0] + jp.dot(crn1, i_inv[0] @ crn1)
+                         + mass_inv[1] + jp.dot(crn2, i_inv[1] @ crn2))
+    dvel = -v_t_dir * jp.minimum(budget, v_t_norm)
 
     angw_1 = jp.cross((contact.pos - x.pos[0]), v_t_dir)
     angw_2 = jp.cross((contact.pos - x.pos[1]), v_t_dir)

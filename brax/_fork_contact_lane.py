@@ -339,8 +339,14 @@ def resolve_velocity(sys, state, xd_i_prev, contact, dlambda):
   v_n = lane.dot3(rel_vel, n)
   v_t = tuple(rel_vel[k] - n[k] * v_n for k in range(3))
   v_t_dir, v_t_norm = lane.normalize3(v_t)
-  scale = -jp.minimum(
-      contact.friction[..., 0] * jp.abs(dlam) / sys.opt.timestep, v_t_norm)
+  budget = contact.friction[..., 0] * jp.abs(dlam) / sys.opt.timestep
+  if sys.friction_budget_velocity:
+    # momentum -> velocity (see System.friction_budget_velocity)
+    crn_a = lane.cross3(ra, n)
+    crn_b = lane.cross3(rb, n)
+    budget = budget * (a['m'] + lane.dot3(crn_a, lane.matvec(a['ii'], crn_a))
+                       + b['m'] + lane.dot3(crn_b, lane.matvec(b['ii'], crn_b)))
+  scale = -jp.minimum(budget, v_t_norm)
   dvel = lane.scale3(v_t_dir, scale)
 
   angw_1 = lane.cross3(ra, v_t_dir)

@@ -213,6 +213,10 @@ def step(
       _j, _jd, _, _ = _kin.world_to_joint(sys, st.x, st.xd)
       _q, _ = _kin.inverse(sys, _j, _jd)
       st = _apply(st, st.x_i + joints.equality_update(sys, st, _q))
+    if sys.connect_link1:
+      # mjEQ_CONNECT loop closures (Robotiq four-bar). Works on world anchors,
+      # so no joint-coordinate reconstruction is needed -- unlike the coupling.
+      st = _apply(st, st.x_i + joints.connect_update(sys, st))
     if c_sw is not None:
       depth = _clane.refresh_depth(sys, st.x, link_sw, rloc_sw, n_w_sw,
                                    dist0_sw)
