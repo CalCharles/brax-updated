@@ -16,6 +16,29 @@
 
 # pylint:disable=g-multiple-import
 import os as _os
+
+# restores the one-sided (no proximal recoil) drive for A/B -- see the
+# two-sided split comment in `drive_update`
+_REACTLEGACY = _os.environ.get(
+    'BRAX_FORK_DRIVE_REACTLEGACY', '0').lower() not in ('0', '', 'false', 'no')
+# Scale on the two-sided proximal recoil (default 1.0 = full two-sided). The
+# recoil rotates the WHOLE proximal set (trunk + the other legs) about EACH
+# driven joint's anchor; a free base shared by many driven legs (Spot: 12 leg
+# servos, one trunk) therefore receives each leg's full-inertia recoil
+# INDEPENDENTLY, and the per-leg trunk rotations SUM into an over-rotation that
+# tips the free base over during a gait (measured: two-sided tilts the walking
+# trunk to 156 deg by the end of a 1.2 s in-place settle; one-sided holds 15
+# deg but reintroduces the ~0.6 m stance glide the recoil exists to remove).
+# Scaling < 1 tempers the summed over-rotation while keeping the contacts able
+# to see the drive momentum. ~1/n_driven_legs is the physical target. 0.0 is
+# exactly one-sided (equivalent to BRAX_FORK_DRIVE_REACTLEGACY=1); 1.0 is the
+# unscaled two-sided default, bit-identical for every fixed-base chain (whose
+# drive_w_prox is 0, so the scale multiplies nothing).
+_DRIVE_PROX_SCALE = float(_os.environ.get('BRAX_FORK_DRIVE_PROX_SCALE', '1'))
+# A/B switch for the mjEQ_CONNECT loop-closure projection (default ON). Set
+# BRAX_FORK_NOCONNECT=1 to drop it and recover the old unconstrained linkage.
+_NOCONNECT = _os.environ.get(
+    'BRAX_FORK_NOCONNECT', '0').lower() not in ('0', '', 'false', 'no')
 from typing import Tuple
 
 from brax import _fork_lane as lane
@@ -691,14 +714,30 @@ def drive_update(sys: System, state: State, act: jax.Array,
   # non-finite at reward -200.46. `drive_kvkp` is still built and carried on
   # System for anyone who needs the ratio; it is deliberately not used here.
   c_err = (theta - target) * live
-  denom = jp.where(jp.asarray(active), w + at, 1.0)
+  # TWO-SIDED drive for free-rooted chains. The original applied the whole
+  # correction to the distal subtree and none to what it recoils against --
+  # exact for a fixed-base arm (the world absorbs it; `drive_w_prox` is 0
+  # there and nothing below changes), but on Spot it made every leg servo a
+  # net external push: momentum enters nowhere the contacts can see, and the
+  # measured result was the whole robot gliding at a steady 1.2 m/s under a
+  # CONSTANT stance command (3.6 m over the 3 s replay vs MuJoCo's +-1.4 cm,
+  # feet slipping 1.4-3.1 mm per substep with friction correctly cancelling
+  # the foot-local slip and the trunk still advancing). The XPBD split is
+  # the standard constraint form: both sides enter the denominator, each
+  # side moves by its own mobility, and the proximal set rotates OPPOSITE
+  # about the same anchor. BRAX_FORK_DRIVE_REACTLEGACY=1 restores one-sided.
+  w_prox = (jp.zeros_like(w) if (sys.drive_w_prox is None or _REACTLEGACY)
+            else _DRIVE_PROX_SCALE * sys.drive_w_prox[safe_j] * live)
+  denom = jp.where(jp.asarray(active), w + w_prox + at, 1.0)
   dlam = (-c_err - at * lam) / denom
   lam_new = jp.where(jp.asarray(active),
                      jp.clip(lam + dlam, -lam_max, lam_max), 0.0)
   d_theta = w * (lam_new - lam) * live
+  d_theta_prox = -w_prox * (lam_new - lam) * live
   axis_j = sys.dof.motion.ang[safe_j]
   axis_w = jax.vmap(math.rotate)(axis_j, a_p.rot)
   dq = axis_w * d_theta[:, None]
+  dq_prox = axis_w * d_theta_prox[:, None]
 
   # A joint drive moves the ENTIRE DISTAL SUBTREE, not the child link alone.
   #
@@ -732,7 +771,22 @@ def drive_update(sys: System, state: State, act: jax.Array,
   desc = desc * active.astype(np.float32)[None, :]
   desc_j = jp.asarray(desc)
 
-  rot_vec = desc_j @ dq
+  # the proximal set = every link in the SAME TREE that is not in the
+  # driven joint's subtree (the trunk and the other legs, for a Spot leg).
+  # Static, like `desc`; zero columns wherever `drive_w_prox` is zero keep
+  # every fixed-base chain's behaviour bit-identical.
+  root_of = np.arange(n_link)
+  for k in range(n_link):
+    a = k
+    while int(sys.link_parents[a]) >= 0:
+      a = int(sys.link_parents[a])
+    root_of[k] = a
+  same_tree = (root_of[:, None] == root_of[None, :]).astype(np.float32)
+  prox = (same_tree - desc) * active.astype(np.float32)[None, :]
+  prox = np.clip(prox, 0.0, 1.0)
+  prox_j = jp.asarray(prox)
+
+  rot_vec = desc_j @ dq + prox_j @ dq_prox
   # keep each driving anchor fixed: a body rotated by `w` about its CoM moves
   # the point at `anchor` by `w x (anchor - com)`; translating the CoM by
   # `w x (com - anchor)` cancels it exactly.
@@ -748,7 +802,8 @@ def drive_update(sys: System, state: State, act: jax.Array,
   # intermediate was pure cost (flagged in `.work/solver_layout_report.md` as a
   # suspect for juggle-gripper's 436 sps against 586 recorded earlier).
   pos_vec = (jp.cross(rot_vec, state.x_i.pos)
-             - desc_j @ jp.cross(dq, a_p.pos))
+             - desc_j @ jp.cross(dq, a_p.pos)
+             - prox_j @ jp.cross(dq_prox, a_p.pos))
 
   rot_q = 0.5 * jax.vmap(math.vec_quat_mul)(rot_vec, state.x_i.rot)
   # No parent reaction term: for the three fixed-base arms the driven chain's
@@ -871,3 +926,69 @@ def equality_update(sys: System, state: State, q_now: jax.Array) -> Transform:
 
   dp_p = jax.tree.map(lambda f: segment_sum(f, p_idx, n_link), dp_p)
   return dp_c + dp_p
+
+
+def connect_update(sys: System, state: State) -> Transform:
+  """mjEQ_CONNECT loop closures, projected as 3-DoF point-to-point ties.
+
+  A connect is a ball joint OUTSIDE the kinematic tree: a point fixed in link1
+  must coincide with a point fixed in link2. The Robotiq 2F-85 four-bar is held
+  shut by four of them (each ties a `follower` to its `coupler`), and without
+  them the fingers move independently and the gripper does not close -- the
+  measured consequence was the scripted grasp scoring 0/6 on brax.
+
+  This is the standard XPBD position constraint. For each connect the world
+  anchors A1, A2 are formed from the LINK-frame offsets built at load; the error
+  e = A1 - A2 is removed by an impulse along `e`, split between the two links by
+  their generalised inverse mass about the anchor (free-body mass plus the
+  angular term r x n . Iinv . r x n), exactly as a contact is split in
+  `collisions`. `eq_relax` under-relaxes it so `integrator.project_xd` does not
+  read the whole snap as velocity (the same reason the joint couplings relax).
+
+  Returns the CoM-frame correction to add to `state.x_i`.
+  """
+  zero = Transform(pos=jp.zeros_like(state.x_i.pos),
+                   rot=jp.zeros_like(state.x_i.rot))
+  n_con = len(sys.connect_link1)
+  if n_con == 0 or _NOCONNECT:
+    return zero
+  l1 = jp.asarray(np.asarray(sys.connect_link1, np.int64))
+  l2 = jp.asarray(np.asarray(sys.connect_link2, np.int64))
+  a1 = sys.connect_anchor1
+  a2 = sys.connect_anchor2
+  n_link = sys.num_links()
+
+  x, xi = state.x, state.x_i
+  # world anchors, from the LINK (body-origin) frame, like a geom's pose
+  A1 = x.pos[l1] + jax.vmap(math.rotate)(a1, x.rot[l1])
+  A2 = x.pos[l2] + jax.vmap(math.rotate)(a2, x.rot[l2])
+  e = A1 - A2
+  dist = jp.sqrt(jp.sum(e * e, axis=-1) + 1e-24)
+  n = e / dist[:, None]
+
+  minv = 1.0 / (sys.link.inertia.mass ** (1 - sys.spring_mass_scale))
+  iinv = com.inv_inertia(sys, state.x)          # world-frame inverse inertia
+  r1 = A1 - xi.pos[l1]
+  r2 = A2 - xi.pos[l2]
+
+  def _w(r, li):
+    rn = jp.cross(r, n)
+    return minv[li] + jp.einsum('ca,cab,cb->c', rn, iinv[li], rn)
+
+  w1, w2 = _w(r1, l1), _w(r2, l2)
+  dl = dist / (w1 + w2 + 1e-12) * sys.eq_relax
+  P = dl[:, None] * n                            # impulse (magnitude * dir)
+
+  # link1 pulls toward link2 (-P), link2 toward link1 (+P)
+  lin = jp.zeros((n_link, 3))
+  lin = lin.at[l1].add(-P * minv[l1][:, None])
+  lin = lin.at[l2].add(P * minv[l2][:, None])
+  dang1 = -jp.einsum('cab,cb->ca', iinv[l1], jp.cross(r1, P))
+  dang2 = jp.einsum('cab,cb->ca', iinv[l2], jp.cross(r2, P))
+  angv = jp.zeros((n_link, 3))
+  angv = angv.at[l1].add(dang1)
+  angv = angv.at[l2].add(dang2)
+
+  drot = 0.5 * jax.vmap(math.vec_quat_mul)(angv, state.x_i.rot)
+  dp = Transform(pos=lin, rot=drot)
+  return jax.tree.map(lambda v: jp.where(jp.isnan(v), 0.0, v), dp)

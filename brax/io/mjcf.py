@@ -271,16 +271,19 @@ def validate_model(mj: mujoco.MjModel) -> None:
   if mj.opt.impratio != 1:
     _FORK_IGNORED.add('opt.impratio')
   # explore_bench fork: equality constraints were dropped without a word.
-  # mjEQ_JOINT is now honoured (io/mjcf.py builds the coupling tables,
-  # positional/joints.py::equality_update projects it); anything else is
-  # recorded here so a caller can see what the backend is not modelling.
+  # mjEQ_JOINT (joint coupling) and mjEQ_CONNECT (loop closure) are now both
+  # honoured (io/mjcf.py builds the tables; positional/joints.py::equality_update
+  # and ::connect_update project them); anything else is recorded here so a
+  # caller can see what the backend is not modelling.
   if mj.neq:
     _kinds = {int(mj.eq_type[_e]) for _e in range(mj.neq)}
-    _unsupported = _kinds - {int(mujoco.mjtEq.mjEQ_JOINT)}
+    _supported = {int(mujoco.mjtEq.mjEQ_JOINT), int(mujoco.mjtEq.mjEQ_CONNECT)}
+    _unsupported = _kinds - _supported
     if _unsupported:
       _FORK_IGNORED.add(
           f'{len(_unsupported)} equality constraint type(s) '
-          f'{sorted(_unsupported)} not implemented (only mjEQ_JOINT is)')
+          f'{sorted(_unsupported)} not implemented (mjEQ_JOINT and '
+          f'mjEQ_CONNECT are)')
 
   # actuators
   if any(i not in [0, 1] for i in mj.actuator_biastype):
@@ -421,6 +424,85 @@ def _dof_inertia_bound(mj: mujoco.MjModel, n_samples: int = 32,
     samples.append(diag)
   return (np.maximum(bound, 1e-9),
           np.maximum(np.median(np.stack(samples), axis=0), 1e-9))
+
+
+def _prox_axis_inertia(mj: mujoco.MjModel, n_samples: int = 32,
+                       seed: int = 0) -> np.ndarray:
+  """Per-DOF axis inertia of everything PROXIMAL to a driven hinge.
+
+  For a joint on a FREE-rooted chain (Spot's legs), a positional drive must
+  split its correction between the distal subtree (`drive_w`) and the rest of
+  the robot it recoils against -- trunk plus the other legs.  This is that
+  proximal side's rigid-body inertia about the joint's world axis at its
+  world anchor: sum over the same-root bodies OUTSIDE the joint's subtree of
+  ``m (|d|^2 - (d.axis)^2) + axis . R I R^T . axis``, median over sampled
+  configurations (same sampling as `_dof_inertia_bound`).  Zero where the
+  chain root is not free -- there the world absorbs the reaction and
+  `drive_update`'s one-sided form is exact.
+  """
+  d = mujoco.MjData(mj)
+  rng = np.random.default_rng(seed)
+  hinge_slide = [j for j in range(mj.njnt)
+                 if int(mj.jnt_type[j]) in (2, 3) and mj.jnt_limited[j]
+                 and np.all(np.isfinite(mj.jnt_range[j]))]
+  # subtree membership: body b's subtree = b plus descendants
+  children = [[] for _ in range(mj.nbody)]
+  for b in range(1, mj.nbody):
+    children[int(mj.body_parentid[b])].append(b)
+  def subtree(b):
+    out, stack = set(), [b]
+    while stack:
+      k = stack.pop()
+      out.add(k)
+      stack.extend(children[k])
+    return out
+  # free-rooted bodies: walk up looking for a free joint
+  def free_rooted(b):
+    while b != 0:
+      for j in range(int(mj.body_jntadr[b]),
+                     int(mj.body_jntadr[b]) + int(mj.body_jntnum[b])):
+        if int(mj.jnt_type[j]) == 0:
+          return True
+      b = int(mj.body_parentid[b])
+    return False
+  targets = []
+  for j in range(mj.njnt):
+    if int(mj.jnt_type[j]) != 3:
+      continue
+    b = int(mj.jnt_bodyid[j])
+    if not free_rooted(b):
+      continue
+    sub = subtree(b)
+    root = int(mj.body_rootid[b])
+    prox = [k for k in range(1, mj.nbody)
+            if int(mj.body_rootid[k]) == root and k not in sub]
+    if prox:
+      targets.append((j, prox))
+  out = np.zeros(mj.nv)
+  if not targets:
+    return out
+  samples = {j: [] for j, _ in targets}
+  for k in range(n_samples + 1):
+    d.qpos[:] = mj.qpos0
+    if k:
+      for j in hinge_slide:
+        lo, hi = float(mj.jnt_range[j][0]), float(mj.jnt_range[j][1])
+        d.qpos[int(mj.jnt_qposadr[j])] = rng.uniform(lo, hi)
+    mujoco.mj_kinematics(mj, d)
+    mujoco.mj_comPos(mj, d)
+    for j, prox in targets:
+      anchor, axis = d.xanchor[j], d.xaxis[j]
+      total = 0.0
+      for b in prox:
+        m = float(mj.body_mass[b])
+        dd = d.xipos[b] - anchor
+        r = d.ximat[b].reshape(3, 3)
+        total += m * (float(dd @ dd) - float(dd @ axis) ** 2)
+        total += float(axis @ (r @ np.diag(mj.body_inertia[b]) @ r.T) @ axis)
+      samples[j].append(total)
+  for j, _ in targets:
+    out[int(mj.jnt_dofadr[j])] = float(np.median(samples[j]))
+  return out
 
 
 def _fold_armature(mj: mujoco.MjModel, lm, link_i: np.ndarray,
@@ -714,17 +796,43 @@ def load_model(mj: mujoco.MjModel) -> System:
   # to 1.3e-4 rad over the full stroke, the Panda's fingers to 9.3e-10 m -- so
   # projecting the coupled joint onto the polynomial of its partner is an
   # EXACT reduction here, not an approximation.
-  # Only the joint-joint form is handled; mjEQ_CONNECT (loop closure) still is
-  # not, and is recorded below rather than ignored.
+  # Both the joint-joint form (mjEQ_JOINT) and the loop closure (mjEQ_CONNECT)
+  # are handled. A connect is a 3-DoF point-to-point tie between two bodies
+  # OUTSIDE the tree: MuJoCo 3.x stores anchor1 in eq_data[0:3] (body1 frame)
+  # and anchor2 in eq_data[3:6] (body2 frame), and the constraint is that the
+  # two anchors coincide in the world. Each anchor is resolved into its LINK's
+  # frame through the same body->link fusion the geoms use (`lm`), so a welded
+  # coupler's anchor lands on the link that actually carries it.
   eq_q1, eq_q2, eq_dof1, eq_dof2 = [], [], [], []
   eq_poly = []
   eq_is_slide = []
-  n_connect = 0
+  con_l1, con_l2, con_a1, con_a2 = [], [], [], []
+
+  def _anchor_in_link(body, anchor_body):
+    li = int(lm.link_of_body[body])
+    if li < 0:
+      return None, None
+    stop = int(lm.link_bodies[li])
+    p, q = lm._rel_transform(body, stop)      # body pose in the link's frame
+    # anchor in the link frame = body offset composed with the local anchor
+    a_link = np.asarray(p, float) + _fork_links._rotate(
+        np.asarray(anchor_body, float), q)
+    return li, a_link
+
   for _e in range(mj.neq):
     _typ = int(mj.eq_type[_e])
+    if _typ == int(mujoco.mjtEq.mjEQ_CONNECT):
+      _b1, _b2 = int(mj.eq_obj1id[_e]), int(mj.eq_obj2id[_e])
+      _l1, _a1 = _anchor_in_link(_b1, mj.eq_data[_e][0:3])
+      _l2, _a2 = _anchor_in_link(_b2, mj.eq_data[_e][3:6])
+      # a connect between two bodies that fused into the SAME link is a rigid
+      # no-op (the loop is already closed by the weld); skip it.
+      if _l1 is None or _l2 is None or _l1 == _l2:
+        continue
+      con_l1.append(_l1); con_l2.append(_l2)
+      con_a1.append(_a1); con_a2.append(_a2)
+      continue
     if _typ != int(mujoco.mjtEq.mjEQ_JOINT):
-      if _typ == int(mujoco.mjtEq.mjEQ_CONNECT):
-        n_connect += 1
       continue
     _j1, _j2 = int(mj.eq_obj1id[_e]), int(mj.eq_obj2id[_e])
     # hinge-hinge or slide-slide; a mixed pair has no single correction axis
@@ -737,14 +845,14 @@ def load_model(mj: mujoco.MjModel) -> System:
     eq_dof1.append(int(mj.jnt_dofadr[_j1]))
     eq_dof2.append(int(mj.jnt_dofadr[_j2]))
     eq_poly.append(np.asarray(mj.eq_data[_e][:5], float))
-  if n_connect:
-    _FORK_IGNORED.add(
-        f'{n_connect} mjEQ_CONNECT loop closure(s) -- not implemented; the '
-        f'affected linkage is unconstrained in brax')
   eq_q1 = np.asarray(eq_q1, np.int64); eq_q2 = np.asarray(eq_q2, np.int64)
   eq_dof1 = np.asarray(eq_dof1, np.int64); eq_dof2 = np.asarray(eq_dof2, np.int64)
   eq_poly = (np.stack(eq_poly) if eq_poly else np.zeros((0, 5)))
   eq_is_slide = np.asarray(eq_is_slide, float)
+  connect_link1 = tuple(int(x) for x in con_l1)
+  connect_link2 = tuple(int(x) for x in con_l2)
+  connect_anchor1 = (np.stack(con_a1) if con_a1 else np.zeros((0, 3)))
+  connect_anchor2 = (np.stack(con_a2) if con_a2 else np.zeros((0, 3)))
 
   # ---- position servos as POSITIONAL DRIVES ------------------------------
   # A MuJoCo `position` actuator is tau = gear^2 kp (ctrl/gear - q) - gear^2 kv
@@ -778,6 +886,10 @@ def load_model(mj: mujoco.MjModel) -> System:
   # free-floating base.
   drive_at = np.ones(mj.nv)
   drive_lam_max = np.full(mj.nv, np.inf)
+  # proximal (recoil-side) inverse mobility for free-rooted driven hinges;
+  # stays 0 for fixed-base chains, so their drive behaviour is unchanged
+  _prox_inertia = _prox_axis_inertia(mj)
+  drive_w_prox = np.where(_prox_inertia > 0, 1.0 / np.maximum(_prox_inertia, 1e-9), 0.0)
   drive_kvkp = np.zeros(mj.nv)
   drive_lo = np.full(mj.nv, -np.inf)
   drive_hi = np.full(mj.nv, np.inf)
@@ -893,6 +1005,7 @@ def load_model(mj: mujoco.MjModel) -> System:
       drive_gear=drive_gear,
       drive_alpha=drive_alpha,
       drive_w=drive_w,
+      drive_w_prox=drive_w_prox,
       drive_at=drive_at,
       drive_lam_max=drive_lam_max,
       drive_kvkp=drive_kvkp,
@@ -902,6 +1015,10 @@ def load_model(mj: mujoco.MjModel) -> System:
       eq_dof2=tuple(int(v) for v in eq_dof2),
       eq_poly=eq_poly,
       eq_is_slide=eq_is_slide,
+      connect_link1=connect_link1,
+      connect_link2=connect_link2,
+      connect_anchor1=connect_anchor1,
+      connect_anchor2=connect_anchor2,
       drive_lo=drive_lo,
       drive_hi=drive_hi,
       drive_force_mask=drive_force_mask,

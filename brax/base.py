@@ -519,6 +519,7 @@ class System(mjx.Model):
   drive_gear: jax.Array = None
   drive_alpha: jax.Array = None
   drive_w: jax.Array = None
+  drive_w_prox: jax.Array = None
   drive_at: jax.Array = None
   drive_lam_max: jax.Array = None
   #: kv / kp per DOF for position servos. MuJoCo's position actuator is
@@ -537,6 +538,27 @@ class System(mjx.Model):
   #: 1.0 where the coupled pair is SLIDE (a translational correction along
   #: the joint axis) rather than HINGE (an angular one).
   eq_is_slide: jax.Array = None
+  # explore_bench fork: mjEQ_CONNECT loop closures (a ball joint OUTSIDE the
+  # kinematic tree -- the Robotiq 2F-85's four-bar is held shut by four of
+  # them). A connect ties a point fixed in link1 to a point fixed in link2:
+  # `connect_link1`/`connect_link2` are the two link indices (STATIC), and
+  # `connect_anchor1`/`connect_anchor2` are the anchor positions in each LINK's
+  # frame (resolved through the same body->link fusion the geoms use, so a
+  # welded coupler's anchor lands on the link that carries it). Projected by
+  # positional/joints.py::connect_update as a 3-DoF point-to-point constraint.
+  connect_link1: Tuple[int, ...] = struct.field(pytree_node=False, default=())
+  connect_link2: Tuple[int, ...] = struct.field(pytree_node=False, default=())
+  connect_anchor1: jax.Array = None
+  connect_anchor2: jax.Array = None
+  #: Coulomb cap in VELOCITY units (opt-in, default False = stock brax).
+  #: Stock brax caps the tangential velocity change of a contact at
+  #: mu * |dlambda| / h, where dlambda = -c / (w1 + w2) is mass x length, so the
+  #: cap is a momentum compared against a velocity. For a light body it is far
+  #: below Coulomb: a 4 cm blocks cube given 0.5 m/s on the floor did not slow.
+  #: True uses mu * |dlambda| * w_n / h = mu * |c| / h, the normal velocity the
+  #: position pass removed, which for a resting body is ~g h per substep, i.e.
+  #: deceleration mu g. Read in collisions.py and _fork_contact_lane.py.
+  friction_budget_velocity: bool = struct.field(pytree_node=False, default=False)
   #: fraction of an equality's positional error corrected per SWEEP. A hard
   #: projection satisfies the constraint inside one substep, and
   #: `integrator.project_xd` then reads that whole displacement as velocity --
