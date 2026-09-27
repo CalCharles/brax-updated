@@ -60,3 +60,6 @@ sysinfo.txt
 *.unitypackage
 
 UnitySDK.log
+
+# MuJoCo writes this diagnostic log in the process working directory.
+MUJOCO_LOG.TXT
