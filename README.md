@@ -1,3 +1,5 @@
+
+Repository organization: [folder guide](docs/repository_layout.md).
 <img src="https://github.com/google/brax/raw/main/docs/img/brax_logo.gif" width="336" height="80" alt="BRAX"/>
 
 > **WARNING**
